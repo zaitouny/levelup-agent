@@ -2,17 +2,50 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { exec, spawn } = require('child_process');
-const io = require('socket.io-client');
-const si = require('systeminformation');
+const { pathToFileURL } = require('url');
+const WebSocket = require('ws');
 
 let isLocked = false;
 let blockerProcess = null;
 let disconnectTimer = null;
+let ws = null;
+let reconnectTimer = null;
+let heartbeatTimer = null;
+let blockerHtmlPath = null;
 
-function resolveConfigPath() {
-  const packagedPath = path.join(process.cwd(), 'config.json');
-  if (fs.existsSync(packagedPath)) return packagedPath;
-  return path.join(__dirname, 'config.json');
+function getConfigPath() {
+  return path.join(path.dirname(process.execPath), 'config.json');
+}
+
+function loadConfig() {
+  const configPath = getConfigPath();
+  if (!fs.existsSync(configPath)) {
+    console.error('Missing config.json next to executable');
+    process.exit(1);
+  }
+
+  let config;
+  try {
+    config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } catch (error) {
+    console.error('Invalid config.json');
+    process.exit(1);
+  }
+
+  if (!config || typeof config.serverUrl !== 'string' || !config.serverUrl.trim()) {
+    console.error('Invalid config: serverUrl is required');
+    process.exit(1);
+  }
+
+  if (!config || typeof config.authToken !== 'string' || !config.authToken.trim()) {
+    console.error('Invalid config: authToken is required');
+    process.exit(1);
+  }
+
+  return {
+    serverUrl: config.serverUrl.trim(),
+    authToken: config.authToken.trim()
+  };
 }
 
 function getLocalIP() {
@@ -27,146 +60,146 @@ function getLocalIP() {
   return '0.0.0.0';
 }
 
-async function getSystemPayload() {
-  const osInfo = await si.osInfo();
+function getSystemPayload() {
   return {
     deviceName: os.hostname(),
     localIP: getLocalIP(),
-    osVersion: `${osInfo.distro} ${osInfo.release}`,
+    osVersion: `${os.type()} ${os.release()}`,
     uptime: os.uptime()
   };
 }
 
-function buildBlockerScript() {
-  return String.raw`
-Add-Type -AssemblyName PresentationFramework
-Add-Type -AssemblyName PresentationCore
-Add-Type -AssemblyName WindowsBase
-Add-Type -Namespace Win32 -Name NativeMethods -MemberDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class NativeMethods {
-  [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
-  [DllImport("user32.dll", SetLastError=true)] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-  [DllImport("user32.dll", SetLastError=true)] public static extern bool ClipCursor(ref RECT lpRect);
-  [DllImport("user32.dll", SetLastError=true)] public static extern bool ClipCursor(IntPtr lpRect);
-  [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
-  [StructLayout(LayoutKind.Sequential)]
-  public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
-}
-"@
-$taskbar = [Win32.NativeMethods]::FindWindow("Shell_TrayWnd", $null)
-if ($taskbar -ne [IntPtr]::Zero) { [Win32.NativeMethods]::ShowWindow($taskbar, 0) | Out-Null }
-$win = New-Object Windows.Window
-$win.WindowStyle = [Windows.WindowStyle]::None
-$win.ResizeMode = [Windows.ResizeMode]::NoResize
-$win.WindowState = [Windows.WindowState]::Maximized
-$win.Topmost = $true
-$win.ShowInTaskbar = $false
-$win.Background = [Windows.Media.Brushes]::Black
-$win.Cursor = [Windows.Input.Cursors]::None
-$grid = New-Object Windows.Controls.Grid
-$stack = New-Object Windows.Controls.StackPanel
-$stack.HorizontalAlignment = [Windows.HorizontalAlignment]::Center
-$stack.VerticalAlignment = [Windows.VerticalAlignment]::Center
-$t1 = New-Object Windows.Controls.TextBlock
-$t1.Text = "Session Paused"
-$t1.FontSize = 64
-$t1.Foreground = [Windows.Media.Brushes]::White
-$t1.TextAlignment = [Windows.TextAlignment]::Center
-$t1.HorizontalAlignment = [Windows.HorizontalAlignment]::Center
-$t2 = New-Object Windows.Controls.TextBlock
-$t2.Text = "Please wait for admin"
-$t2.Margin = "0,18,0,0"
-$t2.FontSize = 30
-$t2.Foreground = [Windows.Media.Brushes]::White
-$t2.TextAlignment = [Windows.TextAlignment]::Center
-$t2.HorizontalAlignment = [Windows.HorizontalAlignment]::Center
-$stack.Children.Add($t1) | Out-Null
-$stack.Children.Add($t2) | Out-Null
-$grid.Children.Add($stack) | Out-Null
-$win.Content = $grid
-$blocked = {
-  param($s,$e)
-  $alt = ($e.KeyboardDevice.Modifiers -band [Windows.Input.ModifierKeys]::Alt) -ne 0
-  if ($e.Key -eq [Windows.Input.Key]::Escape -or $e.Key -eq [Windows.Input.Key]::LWin -or $e.Key -eq [Windows.Input.Key]::RWin -or ($alt -and ($e.SystemKey -eq [Windows.Input.Key]::F4 -or $e.SystemKey -eq [Windows.Input.Key]::Tab -or $e.Key -eq [Windows.Input.Key]::Tab))) {
-    $e.Handled = $true
+function toWsUrl(serverUrl, authToken) {
+  let parsed;
+  try {
+    parsed = new URL(serverUrl);
+  } catch (error) {
+    console.error('Invalid config: serverUrl format is invalid');
+    process.exit(1);
   }
-}
-$win.Add_PreviewKeyDown($blocked)
-$win.Add_Closing({ param($s,$e) $e.Cancel = $true })
-$timer = New-Object Windows.Threading.DispatcherTimer
-$timer.Interval = [TimeSpan]::FromMilliseconds(100)
-$timer.Add_Tick({
-  $w = [System.Windows.SystemParameters]::PrimaryScreenWidth
-  $h = [System.Windows.SystemParameters]::PrimaryScreenHeight
-  $rect = New-Object Win32.NativeMethods+RECT
-  $rect.Left = 0
-  $rect.Top = 0
-  $rect.Right = [int]$w
-  $rect.Bottom = [int]$h
-  [Win32.NativeMethods]::ClipCursor([ref]$rect) | Out-Null
-  if ([Win32.NativeMethods]::GetAsyncKeyState(0x5B) -ne 0 -or [Win32.NativeMethods]::GetAsyncKeyState(0x5C) -ne 0) {
-    [Console]::Beep(37, 20)
+
+  if (parsed.protocol === 'http:') parsed.protocol = 'ws:';
+  if (parsed.protocol === 'https:') parsed.protocol = 'wss:';
+  if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
+    console.error('Invalid config: serverUrl must use http or https');
+    process.exit(1);
   }
-})
-$timer.Start()
-try {
-  $win.ShowDialog() | Out-Null
-} finally {
-  $timer.Stop()
-  [Win32.NativeMethods]::ClipCursor([IntPtr]::Zero) | Out-Null
-  if ($taskbar -ne [IntPtr]::Zero) { [Win32.NativeMethods]::ShowWindow($taskbar, 5) | Out-Null }
+
+  parsed.pathname = '/api/v1/realtime';
+  parsed.search = `token=${encodeURIComponent(authToken)}`;
+  return parsed.toString();
 }
-`;
+
+function sendMessage(payload) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify(payload));
+}
+
+function sendRegistration() {
+  sendMessage({
+    type: 'agent.register',
+    data: getSystemPayload()
+  });
+}
+
+function sendHeartbeat() {
+  sendMessage({
+    type: 'agent.heartbeat',
+    data: getSystemPayload()
+  });
+}
+
+function createBlockerHtml() {
+  const html = '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LevelUp Blocker</title><style>html,body{margin:0;padding:0;width:100%;height:100%;background:#000;color:#fff;overflow:hidden;user-select:none;cursor:none;font-family:Segoe UI,Arial,sans-serif}body{display:flex;align-items:center;justify-content:center;text-align:center}.wrap{display:flex;flex-direction:column;gap:16px}.t1{font-size:64px;font-weight:700;line-height:1.1}.t2{font-size:30px;opacity:.95}</style></head><body><div class="wrap"><div class="t1">Session Paused</div><div class="t2">Please wait for admin</div></div><script>window.oncontextmenu=()=>false;window.onkeydown=(e)=>{e.preventDefault();return false};window.onkeyup=(e)=>{e.preventDefault();return false};window.onkeypress=(e)=>{e.preventDefault();return false};</script></body></html>';
+  blockerHtmlPath = path.join(os.tmpdir(), `levelup-blocker-${process.pid}.html`);
+  fs.writeFileSync(blockerHtmlPath, html, 'utf8');
+  return blockerHtmlPath;
+}
+
+function removeBlockerHtml() {
+  if (!blockerHtmlPath) return;
+  try {
+    if (fs.existsSync(blockerHtmlPath)) fs.unlinkSync(blockerHtmlPath);
+  } catch (_) {}
+  blockerHtmlPath = null;
+}
+
+function resolveEdgeExecutable() {
+  const candidates = [
+    'msedge',
+    'msedge.exe',
+    path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+    path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Microsoft', 'Edge', 'Application', 'msedge.exe')
+  ];
+
+  for (const candidate of candidates) {
+    if (candidate === 'msedge' || candidate === 'msedge.exe') return candidate;
+    if (fs.existsSync(candidate)) return candidate;
+  }
+
+  return 'msedge';
 }
 
 function startBlocker() {
   if (isLocked) return;
-  const script = buildBlockerScript();
-  blockerProcess = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-Command', script], {
-    detached: false,
-    stdio: 'ignore'
-  });
 
-  blockerProcess.on('exit', () => {
+  try {
+    const htmlPath = createBlockerHtml();
+    const edge = resolveEdgeExecutable();
+    const url = pathToFileURL(htmlPath).toString();
+    const args = ['--kiosk', '--edge-kiosk-type=fullscreen', '--no-first-run', '--disable-restore-session-state', url];
+
+    blockerProcess = spawn(edge, args, {
+      detached: false,
+      stdio: 'ignore',
+      windowsHide: true
+    });
+
+    blockerProcess.on('exit', () => {
+      blockerProcess = null;
+      if (isLocked) {
+        isLocked = false;
+        removeBlockerHtml();
+        console.log('🔓 Blocker released');
+      }
+    });
+
+    blockerProcess.on('error', () => {
+      blockerProcess = null;
+      if (isLocked) {
+        isLocked = false;
+        removeBlockerHtml();
+        console.log('🔓 Blocker released');
+      }
+    });
+
+    isLocked = true;
+    console.log('🔒 Blocker activated');
+  } catch (error) {
+    isLocked = false;
     blockerProcess = null;
-    if (isLocked) {
-      isLocked = false;
-      console.log('🔓 Blocker released');
-    }
-  });
-
-  blockerProcess.on('error', () => {
-    blockerProcess = null;
-    if (isLocked) {
-      isLocked = false;
-      console.log('🔓 Blocker released');
-    }
-  });
-
-  isLocked = true;
-  console.log('🔒 Blocker activated');
+    removeBlockerHtml();
+    console.error('Blocker start failed:', error.message);
+  }
 }
 
 function stopBlocker() {
   if (!isLocked) return;
+
   if (blockerProcess && blockerProcess.pid) {
     try {
-      process.kill(blockerProcess.pid, 'SIGTERM');
+      exec(`taskkill /PID ${blockerProcess.pid} /T /F`, () => {});
     } catch (_) {}
-    exec(`taskkill /PID ${blockerProcess.pid} /T /F`, () => {});
   }
+
   blockerProcess = null;
   isLocked = false;
-  exec('powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -Namespace Win32 -Name NativeMethods -MemberDefinition \"[System.Runtime.InteropServices.DllImport(\\\"user32.dll\\\")] public static extern System.IntPtr FindWindow(string lpClassName, string lpWindowName); [System.Runtime.InteropServices.DllImport(\\\"user32.dll\\\")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);\"; $h=[Win32.NativeMethods]::FindWindow(\\\"Shell_TrayWnd\\\",$null); if($h -ne [IntPtr]::Zero){[Win32.NativeMethods]::ShowWindow($h,5)|Out-Null}"', () => {});
-  exec('powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -Namespace Win32 -Name NativeMethods -MemberDefinition \"[System.Runtime.InteropServices.DllImport(\\\"user32.dll\\\")] public static extern bool ClipCursor(System.IntPtr lpRect);\"; [Win32.NativeMethods]::ClipCursor([IntPtr]::Zero)|Out-Null"', () => {});
+  removeBlockerHtml();
+  exec('taskkill /IM msedge.exe /F', () => {});
   console.log('🔓 Blocker released');
 }
 
-function handleCommand(payload) {
-  const command = typeof payload === 'string' ? payload : payload && typeof payload === 'object' ? payload.data || payload.command || '' : '';
-
+function handleCommand(command) {
   switch (command) {
     case 'lock':
       startBlocker();
@@ -181,63 +214,67 @@ function handleCommand(payload) {
       exec('shutdown /r /t 0');
       break;
     default:
-      console.log('Unknown command:', command);
+      break;
   }
 }
 
-async function start() {
-  const configPath = resolveConfigPath();
-  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+function scheduleReconnect(connectFn) {
+  if (reconnectTimer) return;
+  console.log('Reconnecting');
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectFn();
+  }, 3000);
+}
 
-  const socket = io(config.serverUrl, {
-    auth: { token: config.authToken },
-    transports: ['websocket']
-  });
+function connectWebSocket(wsUrl) {
+  ws = new WebSocket(wsUrl);
 
-  socket.on('connect', async () => {
+  ws.on('open', () => {
+    console.log('Connected');
     if (disconnectTimer) {
       clearTimeout(disconnectTimer);
       disconnectTimer = null;
     }
-
-    try {
-      const payload = await getSystemPayload();
-      socket.emit('agent:register', payload);
-      console.log('Connected to server:', config.serverUrl);
-      console.log('Registered:', payload);
-    } catch (error) {
-      console.error('Failed to register agent:', error.message);
-    }
+    sendRegistration();
   });
 
-  socket.on('disconnect', (reason) => {
-    console.log('Disconnected:', reason);
+  ws.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (msg && msg.type === 'command' && typeof msg.data === 'string') {
+        handleCommand(msg.data);
+      }
+    } catch (_) {}
+  });
+
+  ws.on('error', (error) => {
+    console.error('Error', error.message);
+  });
+
+  ws.on('close', () => {
+    console.log('Disconnected');
     if (disconnectTimer) clearTimeout(disconnectTimer);
     disconnectTimer = setTimeout(() => {
       if (isLocked) stopBlocker();
       disconnectTimer = null;
     }, 60000);
+    scheduleReconnect(() => connectWebSocket(wsUrl));
   });
-
-  socket.on('connect_error', (error) => {
-    console.error('Connection error:', error.message);
-  });
-
-  setInterval(async () => {
-    if (!socket.connected) return;
-    try {
-      const payload = await getSystemPayload();
-      socket.emit('agent:heartbeat', payload);
-      console.log('Heartbeat sent');
-    } catch (error) {
-      console.error('Heartbeat failed:', error.message);
-    }
-  }, 10000);
-
-  socket.on('command', handleCommand);
 }
 
-start().catch((error) => {
-  console.error('Agent startup failed:', error.message);
-  process.exit(1);
-});
+function startHeartbeat() {
+  if (heartbeatTimer) return;
+  heartbeatTimer = setInterval(() => {
+    sendHeartbeat();
+  }, 10000);
+}
+
+function start() {
+  const config = loadConfig();
+  const wsUrl = toWsUrl(config.serverUrl, config.authToken);
+  connectWebSocket(wsUrl);
+  startHeartbeat();
+}
+
+start();
