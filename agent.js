@@ -37,8 +37,8 @@ async function start() {
   const configPath = resolveConfigPath();
   const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 
-  const socket = io(config.serverUrl, {
-    auth: { token: config.authToken },
+  const socket = io(`${config.serverUrl}/api/v1/realtime`, {
+        auth: { token: config.authToken },
     transports: ['websocket']
   });
 
