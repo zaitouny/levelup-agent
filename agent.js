@@ -2,7 +2,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { exec } = require('child_process');
-const io = require('socket.io-client');
+const WebSocket = require('ws');
 const si = require('systeminformation');
 
 function resolveConfigPath() {
@@ -34,65 +34,110 @@ async function getSystemPayload() {
 }
 
 async function start() {
-  const configPath = resolveConfigPath();
-  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  try {
+    const configPath = resolveConfigPath();
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 
-  const socket = io(`${config.serverUrl}/api/v1/realtime`, {
-        auth: { token: config.authToken },
-    transports: ['websocket']
-  });
+    if (!config.serverUrl || !config.authToken) {
+      throw new Error('Invalid config.json (serverUrl or authToken missing)');
+    }
 
-  socket.on('connect', async () => {
-    try {
+    const wsUrl =
+      config.serverUrl.replace(/^http/, 'ws') +
+      `/api/v1/realtime?token=${config.authToken}`;
+
+    console.log('Connecting to:', wsUrl);
+
+    const ws = new WebSocket(wsUrl);
+
+    ws.on('open', async () => {
+      console.log('✅ Connected to server');
+
       const payload = await getSystemPayload();
-      socket.emit('agent:register', payload);
-      console.log('Connected to server:', config.serverUrl);
-      console.log('Registered:', payload);
-    } catch (error) {
-      console.error('Failed to register agent:', error.message);
-    }
-  });
 
-  socket.on('disconnect', (reason) => {
-    console.log('Disconnected:', reason);
-  });
+      ws.send(
+        JSON.stringify({
+          type: 'agent.register',
+          data: payload
+        })
+      );
 
-  socket.on('connect_error', (error) => {
-    console.error('Connection error:', error.message);
-  });
+      console.log('📡 Registered:', payload);
+    });
 
-  setInterval(async () => {
-    if (!socket.connected) return;
-    try {
+    ws.on('message', async (message) => {
+      try {
+        const data = JSON.parse(message.toString());
+
+        // Ping from server
+        if (data.type === 'realtime.ping') {
+          ws.send(
+            JSON.stringify({
+              type: 'agent.pong',
+              ts: Date.now()
+            })
+          );
+          return;
+        }
+
+        // Commands
+        if (data.type === 'command') {
+          console.log('⚡ Command received:', data.data);
+
+          switch (data.data) {
+            case 'lock':
+              console.log('🔒 DEVICE LOCKED');
+              break;
+
+            case 'unlock':
+              console.log('🔓 DEVICE UNLOCKED');
+              break;
+
+            case 'shutdown':
+              exec('shutdown /s /t 0');
+              break;
+
+            case 'restart':
+              exec('shutdown /r /t 0');
+              break;
+
+            default:
+              console.log('Unknown command:', data.data);
+          }
+        }
+      } catch (err) {
+        console.error('Message parse error:', err.message);
+      }
+    });
+
+    ws.on('close', (code, reason) => {
+      console.log('❌ Disconnected:', code, reason?.toString());
+      setTimeout(start, 5000); // Auto-reconnect
+    });
+
+    ws.on('error', (err) => {
+      console.error('❌ WebSocket error:', err.message);
+    });
+
+    // Heartbeat every 10 seconds
+    setInterval(async () => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+
       const payload = await getSystemPayload();
-      socket.emit('agent:heartbeat', payload);
-      console.log('Heartbeat sent');
-    } catch (error) {
-      console.error('Heartbeat failed:', error.message);
-    }
-  }, 10000);
 
-  socket.on('command', (command) => {
-    switch (command) {
-      case 'lock':
-        console.log('DEVICE LOCKED');
-        break;
-      case 'unlock':
-        console.log('DEVICE UNLOCKED');
-        break;
-      case 'shutdown':
-        exec('shutdown /s /t 0');
-        break;
-      case 'restart':
-        exec('shutdown /r /t 0');
-        break;
-      default:
-        console.log('Unknown command:', command);
-    }
-  });
+      ws.send(
+        JSON.stringify({
+          type: 'agent.heartbeat',
+          data: payload
+        })
+      );
+
+      console.log('💓 Heartbeat sent');
+    }, 10000);
+  } catch (err) {
+    console.error('❌ Agent startup failed:', err.message);
+    process.exit(1);
+  }
 }
 
-start().catch((error) => {
-  console.error('Agent startup failed:', error.message);
-  process.exit(1);
-});
+start();
